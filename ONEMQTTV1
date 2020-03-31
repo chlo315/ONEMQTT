@@ -1,0 +1,601 @@
+#! python3
+# -*- coding:utf-8 -*-
+#encoding=utf-8
+#ChenLong,chlo315@163.com
+import sys,os,os.path,threading,json,logging,codecs
+import paho.mqtt.client as mqtt
+import datetime,time
+from PyQt5.QtWidgets import QApplication, QMainWindow
+from PyQt5.Qt import (QApplication, QWidget, QPushButton, QThread, QMutex, pyqtSignal, QFileDialog)
+from PyQt5 import QtGui,QtCore
+import MQTTUIV1
+from functools import partial
+import configparser
+from multiprocessing import Process
+from time import sleep
+ 
+logging.basicConfig(level = logging.DEBUG, format = '%(message)s') 
+#logging .debug('Start of program')   
+#UNIX秒转本地时间
+def timestamp_datetime(value):
+    format = '%Y-%m-%d %H:%M:%S'
+    # value为传入的值为时间戳(整形)，如：1332888820
+    #转换为本地时间
+    value = time.localtime(value)
+    #value = time.gmtime(value)
+    ## 经过localtime转换后变成
+    ## time.struct_time(tm_year=2012, tm_mon=3, tm_mday=28, tm_hour=6, tm_min=53, tm_sec=40, tm_wday=2, tm_yday=88, tm_isdst=0)
+    # 最后再经过strftime函数转换为正常日期格式。
+    dt = time.strftime(format, value)
+    return dt 
+
+#本地时间转UNIX秒
+def datetime_timestamp(dt):
+     #dt为字符串
+     #中间过程，一般都需要将字符串转化为时间数组
+     time.strptime(dt, '%Y-%m-%d %H:%M:%S')
+     ## time.struct_time(tm_year=2012, tm_mon=3, tm_mday=28, tm_hour=6, tm_min=53, tm_sec=40, tm_wday=2, tm_yday=88, tm_isdst=-1)
+     #将"2012-03-28 06:53:40"转化为时间戳
+     s = time.mktime(time.strptime(dt, '%Y-%m-%d %H:%M:%S'))
+     return int(s)    
+
+# 连接回调
+def on_connect(client, userdata, flags, respons_code):
+    if respons_code == 0:
+        # 连接成功
+        ui.LinkButton.setEnabled(False)
+        #禁能配置框
+        ui.BrokerAddress.setEnabled(False)
+        ui.BrokerPort.setEnabled(False)
+        ui.UserName.setEnabled(False)
+        ui.PassWord.setEnabled(False)
+        ui.ConnectFlag.setText('连接成功')
+    else:
+        ui.LinkButton.setEnabled(True)
+        #使能配置框
+        ui.BrokerAddress.setEnabled(True)
+        ui.BrokerPort.setEnabled(True)
+        ui.UserName.setEnabled(True)
+        ui.PassWord.setEnabled(True)
+        client.disconnect()
+        client.loop_stop()
+        if respons_code == 1:
+            ui.ConnectFlag.setText('协议版本错误')  
+        elif respons_code == 2:
+            ui.ConnectFlag.setText('无效的客户端标识')
+        elif respons_code == 3:
+            ui.ConnectFlag.setText('服务器无法使用')
+        elif respons_code == 4:
+            ui.ConnectFlag.setText('错误的用户名或密码')
+        elif respons_code == 5:
+            ui.ConnectFlag.setText('未经授权')
+        else:
+            ui.ConnectFlag.setText('未知原因')
+            
+# 断开连接回调
+def on_disconnect(client, userdata, respons_code):
+    if respons_code == 0:
+        # 主动断开
+        #使能连接按钮
+        ui.LinkButton.setEnabled(True)
+        #使能配置框
+        ui.BrokerAddress.setEnabled(True)
+        ui.BrokerPort.setEnabled(True)
+        ui.UserName.setEnabled(True)
+        ui.PassWord.setEnabled(True)
+        #提示连接状态
+        ui.ConnectFlag.setText('已断开')
+    else:
+        ui.ConnectFlag.setText('中断连接,等待重连')
+    
+# 发布成功回调
+def on_publish(client, userdata, mid):
+    global alreadysend
+    alreadysend = alreadysend + 1
+    ui.AlreadySend.setText(str(alreadysend))
+
+# 订阅成功回调
+def on_subscribe(client, userdata, mid, granted_qos):
+    ui.RecButton.setEnabled(False)
+    #禁能输入框
+    ui.Subscribe.setEnabled(False)
+ 
+# 订阅不成功回调 
+def on_unsubscribe(client, userdata, mid):
+    ui.RecButton.setEnabled(True)
+    #使能输入框
+    ui.Subscribe.setEnabled(True)
+
+# 订阅统计 
+def statisticrecord():
+    global substart
+    global alreadyreceived
+    global timeoutnum
+    global totaltime
+    global timestart
+    global longesttime
+    global pretime
+    global thistime
+    global pauset
+    global starttimes
+    alreadyreceived = alreadyreceived + 1
+    if substart != 2:
+        thistime =  time.time()
+        timestart = thistime
+        substart = 2
+        starttimes = starttimes + 1
+        return
+    else:
+        pretime =  thistime
+        thistime =  time.time()
+    if ui.IntevalTimeout.isChecked() ==  True: 
+        if ui.BeyondTime.text() != '':
+            t = float(ui.BeyondTime.text())
+            if t < 0.1:
+                t = 0.1
+                ui.BeyondTime.setText(str(t))
+        else:
+            t = 0.1
+            ui.BeyondTime.setText(str(t))
+        t3 = float(format(thistime-pretime, '0.1f'))
+        if t3 > t:
+            timeoutnum = timeoutnum + 1
+            ui.TimeOutNUM.setText(str(timeoutnum))
+        if t3 > longesttime:
+            longesttime = t3
+            ui.LongestTime.setText(str(format(longesttime, '0.1f')))
+        ui.Percent.setText(str(format((timeoutnum * 100)/alreadyreceived, '2.1f'))+ '%')
+   #计算订阅总时长 
+    totaltime = (time.time() - timestart) + pauset
+    #计算接收间隔 
+    ui.AverageTime.setText(format(totaltime/(alreadyreceived - starttimes), '0.1f'))
+
+# 选取记录内容
+def selectrecord(msg):
+    global data
+    data = ''
+    if ui.SubTimerCheck.isChecked() ==  True:
+        data =str(datetime.datetime.now())
+    if ui.SubCheck.isChecked() ==  True:
+        if data == '':
+            data = str(ui.Subscribe.text())
+        else:
+            data = data + ',' + str(ui.Subscribe.text())
+    if ui.MSGCheck.isChecked() ==  True: 
+        if data == '':
+            data = str( msg.payload.decode("utf-8"))
+        else:
+            data = data + ',' + str( msg.payload.decode("utf-8"))
+    try:
+        dicmsg = json.loads( msg.payload.decode("utf-8"))      
+        if ui.SelectK1.isChecked() ==  True:  
+            if str(ui.Key1.text()) in dicmsg.keys():
+                k1value = dicmsg[str(ui.Key1.text())]
+                if ui.SelectK1U.isChecked() ==  True: 
+                    try:
+                        k1value = timestamp_datetime(int(k1value))
+                        if str(ui.Log.text()) == 'K1值非UNIX秒时间':
+                            ui.Log.setText('') 
+                    except:
+                        ui.Log.setText('K1值非UNIX秒时间') 
+                if data == '':
+                    data = str(ui.Key1.text()) + ':' + k1value
+                else:
+                    data = data + ',' + str(ui.Key1.text()) + ':' + k1value
+        if ui.SelectK2.isChecked() ==  True:  
+            if str(ui.Key2.text()) in dicmsg.keys():
+                k2value = dicmsg[str(ui.Key2.text())]
+                if ui.SelectK2U.isChecked() ==  True: 
+                    try:
+                        k2value = timestamp_datetime(int(k2value))
+                        if str(ui.Log.text()) == 'K2值非UNIX秒时间':
+                            ui.Log.setText('') 
+                    except:
+                        ui.Log.setText('K2值非UNIX秒时间') 
+                if data == '':
+                    data = str(ui.Key2.text()) + ':' + k2value
+                else:
+                    data = data + ',' + str(ui.Key2.text()) + ':' + k2value
+        if ui.SelectK3.isChecked() ==  True:  
+            if str(ui.Key3.text()) in dicmsg.keys():
+                k3value = dicmsg[str(ui.Key3.text())]
+                if ui.SelectK3U.isChecked() ==  True: 
+                    try:
+                        k3value = timestamp_datetime(int(k3value))
+                        if str(ui.Log.text()) == 'K3值非UNIX秒时间':
+                            ui.Log.setText('') 
+                    except:
+                        ui.Log.setText('K3值非UNIX秒时间') 
+                if data == '':
+                    data = str(ui.Key3.text()) + ':' + k3value
+                else:
+                    data = data + ',' + str(ui.Key3.text()) + ':' + k3value
+        if str(ui.Log.text()) == '解析JSON格式有误':
+            ui.Log.setText('') 
+    #except ValueError:
+    except :
+        ui.Log.setText('解析JSON格式有误') 
+    #接收总数更新
+    ui.AlreadyReceived.setText(str(alreadyreceived))
+
+#订阅记录
+def writefile():
+    global data
+    if data != '':
+        if (ui.SaveCheck.isChecked() ==  True) and (ui.SaveFile.text() !=''):
+            try:
+                f = open(ui.SaveFile.text() , 'a')
+                f.write(data +'\n' )
+                f.close()
+                if str(ui.Log.text()) == '写文件失败':
+                    ui.Log.setText('') 
+            except:
+                try:
+                    f.close()
+                    ui.Log.setText('写文件失败') 
+                except:
+                    ui.Log.setText('写文件失败') 
+def refresh():
+    ui.ReciveMsg.setPlainText(data)
+
+# 接收到数据后回调
+def on_message(client, userdata, msg):
+    #订阅统计
+    statisticrecord()
+    #选择展示内容
+    selectrecord(msg)
+    #订阅记录
+    writefile()  
+    
+def linkmqtt():
+    if ui.BrokerAddress.text() != '':
+        host = str(ui.BrokerAddress.text())
+        if str(ui.Log.text()) == '请输入代理地址':
+            ui.Log.setText('') 
+    else:
+        ui.Log.setText('请输入代理地址')
+        return
+    if ui.BrokerPort.text() != '':  
+        port = int(ui.BrokerPort.text())
+        if str(ui.Log.text()) == '请输入代理端口':
+            ui.Log.setText('') 
+    else:
+        ui.Log.setText('请输入代理端口') 
+        return
+    username = str(ui.UserName.text())
+    password = str(ui.PassWord.text())
+    # 设置账号密码
+    if username != '':
+        client.username_pw_set(username, password=password)
+    # 注册事件
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    client.on_publish = on_publish
+    client.on_subscribe = on_subscribe
+    client.on_unsubscribe = on_unsubscribe
+    client.reconnect_delay_set(min_delay=1, max_delay=120) 
+    # 连接到服务器
+    try:
+        client.connect(host, port = port, keepalive=60)
+        client.loop_start()
+    except:
+        ui.ConnectFlag.setText('连接失败')
+
+def unlinkmqtt():
+    client.disconnect()
+    client.loop_stop()
+    
+# 把函数放到改写到类的run方法中，便可以通过调用类方法，实现线程的终止
+class publicThread(threading.Thread):
+    def __init__(self, daemon=None):
+        super(publicThread, self).__init__(daemon=daemon)
+        self.__is_running = True
+        self.daemon = daemon
+ 
+    def terminate(self):
+        self.__is_running = False
+ 
+    def run(self):
+        ui.SendButton.setEnabled(False)
+        #禁能输入框
+        ui.Topic.setEnabled(False)
+        while self.__is_running:
+            client.publish(str(ui.Topic.text()), payload=str(ui.Dialog.toPlainText()), qos=0, retain=False)
+            if ui.SendTimer.text() != '':
+                t = float(ui.SendTimer.text())
+                if t < 0.1:
+                    t = 0.1
+                    ui.SendTimer.setText(str(t))
+                time.sleep(t)
+            else:
+                t = 0.1
+                ui.SendTimer.setText(str(t))
+            
+#发送 
+def sendmessage():
+    if ui.Topic.text() != '':
+        if str(ui.Log.text()) == '请先输入发布主题':
+            ui.Log.setText('')
+        if ui.TimerCheck.isChecked() ==  True:
+            thread.start()
+        else:
+            client.publish(str(ui.Topic.text()), payload=str(ui.Dialog.toPlainText()), qos=0, retain=False)
+    else:
+        ui.Log.setText('请先输入发布主题') 
+    
+
+#停止发送       
+def stopsend():  
+    global thread
+    thread.terminate()
+    thread = publicThread()
+    thread.daemon = True
+    ui.SendButton.setEnabled(True)
+    #使能输入框
+    ui.Topic.setEnabled(True)
+
+def timercheck():
+    if ui.TimerCheck.isChecked() !=  True:
+        stopsend()
+    
+#发送清零   
+def sendclear(): 
+    global alreadysend
+    alreadysend = 0
+    ui.AlreadySend.setText(str(alreadysend))
+    
+#发送文件选择
+def fileselect():
+    fileName1 = QFileDialog.getOpenFileName(MainWindow,'./')[0]
+    if fileName1 != '':
+        ui.FileSelect.setText(fileName1)
+        if ui.PublicCheck.isChecked() ==  True:
+            ui.Dialog.setPlainText(open(fileName1, 'r').read())
+
+#填充发布框        
+def publiccheck(): 
+    if ui.PublicCheck.isChecked() ==  True:
+        if ui.FileSelect.text() != '':
+            try:
+                ui.Dialog.setPlainText(open(ui.FileSelect.text(), 'r').read())
+                if str(ui.Log.text()) == '发布文件不存在':
+                    ui.Log.setText('')
+            except:
+                ui.Log.setText('发布文件不存在') 
+    else:
+        ui.Dialog.setPlainText('')
+        
+#订阅  
+def recbutton():
+    global substart
+    client.subscribe(str(ui.Subscribe.text()),0)
+    substart = 1
+    
+    
+#取消订阅     
+def stoprec():
+    global substart
+    global pauset
+    client.unsubscribe(ui.Subscribe.text())
+    ui.RecButton.setEnabled(True)
+    #使能输入框
+    ui.Subscribe.setEnabled(True)
+    pauset = time.time() - timestart + pauset
+    substart = 0
+    
+#统计清零
+def recclear():
+    global alreadyreceived
+    global substart
+    global timeoutnum
+    global pauset
+    global starttimes
+    global longesttime
+    global pretime
+    global thistime
+    alreadyreceived = 0
+    substart = 1
+    timeoutnum = 0
+    pauset = 0
+    starttimes = 0
+    longesttime = 0
+    pretime = 0
+    thistime = 0
+    ui.AlreadyReceived.setText(str(0))
+    ui.TimeOutNUM.setText('')
+    ui.Percent.setText('')
+    ui.AverageTime.setText('')
+    ui.LongestTime.setText('')
+    
+#记录文件选择
+def filebutton2():
+    recordfile = QFileDialog.getOpenFileName(MainWindow,'./')[0]
+    if recordfile != '':
+        ui.SaveFile.setText(recordfile)
+              
+#保存配置文件
+def savebutton():
+    # 配置文件是否存在，不存在则生成，存在则保存
+    global configname
+    if os.path.isfile(configname) !=  True:
+        try:
+            fp = open(configname,'w')
+            fp.close()
+        except:
+            ui.Log.setText('无法创建配置文件 '+ configname) 
+            return 
+    config.read(configname, encoding='utf-8')
+    #代理设置
+    if config.has_section('BrokerProfileSettings') != True:
+        config.add_section('BrokerProfileSettings')
+    config.set('BrokerProfileSettings', 'BrokerAddress', ui.BrokerAddress.text())
+    config.set('BrokerProfileSettings', 'BrokerPort', ui.BrokerPort.text())
+    config.set('BrokerProfileSettings', 'UserName', ui.UserName.text())
+    config.set('BrokerProfileSettings', 'PassWord', ui.PassWord.text())
+    
+    #发布设置
+    if config.has_section('PublishSettings') != True:
+        config.add_section('PublishSettings')
+    config.set('PublishSettings', 'Topic', ui.Topic.text())
+    config.set('PublishSettings', 'PublicCheck', str(ui.PublicCheck.isChecked()))
+    config.set('PublishSettings', 'FileSelect', ui.FileSelect.text())
+    config.set('PublishSettings', 'TimerCheck', str(ui.TimerCheck.isChecked()))
+    config.set('PublishSettings', 'SendTimer', ui.SendTimer.text())
+    
+    #订阅设置
+    if config.has_section('SubscribeSettings') != True:
+        config.add_section('SubscribeSettings')
+    config.set('SubscribeSettings', 'Subscribe', ui.Subscribe.text())
+    config.set('SubscribeSettings', 'SaveCheck',  str(ui.SaveCheck.isChecked()))
+    config.set('SubscribeSettings', 'SaveFile', ui.SaveFile.text())
+    config.set('SubscribeSettings', 'SubTimerCheck',  str(ui.SubTimerCheck.isChecked()))
+    config.set('SubscribeSettings', 'SubCheck',  str(ui.SubCheck.isChecked()))
+    config.set('SubscribeSettings', 'MSGCheck',  str(ui.MSGCheck.isChecked()))
+    config.set('SubscribeSettings', 'SelectK1U',  str(ui.SelectK1U.isChecked()))
+    config.set('SubscribeSettings', 'SelectK2U',  str(ui.SelectK2U.isChecked()))
+    config.set('SubscribeSettings', 'SelectK3U',  str(ui.SelectK3U.isChecked()))
+    config.set('SubscribeSettings', 'SelectK1',  str(ui.SelectK1.isChecked()))
+    config.set('SubscribeSettings', 'Key1', ui.Key1.text())
+    config.set('SubscribeSettings', 'SelectK2',  str(ui.SelectK2.isChecked()))
+    config.set('SubscribeSettings', 'Key2', ui.Key2.text())
+    config.set('SubscribeSettings', 'SelectK3',  str(ui.SelectK3.isChecked()))
+    config.set('SubscribeSettings', 'Key3', ui.Key3.text())
+    config.set('SubscribeSettings', 'IntevalTimeout',  str(ui.IntevalTimeout.isChecked()))
+    config.set('SubscribeSettings', 'BeyondTime', ui.BeyondTime.text())
+    config.write(codecs.open(configname,'w',encoding='utf-8'))
+    ui.Log.setText('配置文件保存成功') 
+    
+
+#读取配置文件
+def readconfig():
+    # 配置文件是否存在，不存在则退出，存在则读取
+    global configname
+    if os.path.isfile(configname) !=  True:
+        return 
+    config.read(configname, encoding='utf-8')
+    
+    #代理读取
+    ui.BrokerAddress.setText(config.get('BrokerProfileSettings','BrokerAddress'))
+    ui.BrokerPort.setText(config.get('BrokerProfileSettings','BrokerPort'))
+    ui.UserName.setText(config.get('BrokerProfileSettings','UserName'))
+    ui.PassWord.setText(config.get('BrokerProfileSettings','PassWord')) 
+    
+    #发布读取
+    ui.Topic.setText(config.get('PublishSettings','Topic'))
+    ui.PublicCheck.setChecked(config.getboolean('PublishSettings','PublicCheck'))
+    ui.FileSelect.setText(config.get('PublishSettings','FileSelect'))
+    if ui.PublicCheck.isChecked() ==  True:
+        if ui.FileSelect.text() != '':
+            try:
+                ui.Dialog.setPlainText(open(ui.FileSelect.text(), 'r').read())
+            except:
+                ui.FileSelect.setText('')  
+    else:
+        ui.Dialog.setPlainText('')
+    ui.TimerCheck.setChecked(config.getboolean('PublishSettings','TimerCheck'))
+    ui.SendTimer.setText(config.get('PublishSettings',r'SendTimer'))
+    
+    #订阅读取
+    ui.Subscribe.setText(config.get('SubscribeSettings','Subscribe'))
+    ui.SaveCheck.setChecked(config.getboolean('SubscribeSettings','SaveCheck'))
+    ui.SaveFile.setText(config.get('SubscribeSettings','SaveFile'))
+    ui.SubTimerCheck.setChecked(config.getboolean('SubscribeSettings','SubTimerCheck'))
+    ui.SubCheck.setChecked(config.getboolean('SubscribeSettings','SubCheck'))
+    ui.MSGCheck.setChecked(config.getboolean('SubscribeSettings','MSGCheck'))
+    ui.SelectK1U.setChecked(config.getboolean('SubscribeSettings','SelectK1U'))
+    ui.SelectK2U.setChecked(config.getboolean('SubscribeSettings','SelectK2U'))
+    ui.SelectK3U.setChecked(config.getboolean('SubscribeSettings','SelectK3U'))
+    ui.SelectK1.setChecked(config.getboolean('SubscribeSettings','SelectK1'))
+    ui.Key1.setText(config.get('SubscribeSettings','Key1'))
+    ui.SelectK2.setChecked(config.getboolean('SubscribeSettings','SelectK2'))
+    ui.Key2.setText(config.get('SubscribeSettings','Key2'))
+    ui.SelectK3.setChecked(config.getboolean('SubscribeSettings','SelectK3'))
+    ui.Key3.setText(config.get('SubscribeSettings','Key3'))
+    ui.IntevalTimeout.setChecked(config.getboolean('SubscribeSettings','IntevalTimeout'))
+    ui.BeyondTime.setText(config.get('SubscribeSettings','BeyondTime'))
+
+   
+'''********************主函数********************'''   
+#配置文件名
+configname = 'ONEMQTT.ini'   
+#已发送帧数
+alreadysend = 0
+#已接收帧数
+alreadyreceived = 0
+#订阅状态码
+substart = 0
+#超时次数
+timeoutnum = 0
+#暂停前时间
+pauset = 0
+#重统计次数
+starttimes = 0
+#累计接收时间，秒
+totaltime = 0
+#最长超时时间，秒
+longesttime = 0
+#上次时刻
+pretime = 0
+#本次时刻
+thistime = 0
+#数据
+data = ''
+if __name__ == '__main__':
+    #PYQT5窗口函数
+    app = QApplication(sys.argv)
+    MainWindow = QMainWindow()
+    ui = MQTTUIV1.Ui_MQTT()
+    ui.setupUi(MainWindow)
+    MainWindow.show()
+    #读取配置文件
+    # 生成ConfigParser对象
+    config = configparser.ConfigParser()
+    readconfig()
+    #设置MQTT连接参数
+    client_id = time.strftime('%Y%m%d%H%M%S', time.localtime(time.time()))
+    ui.ClientID.setText(client_id)
+    client = mqtt.Client(client_id,clean_session=False,protocol = mqtt.MQTTv311)
+    #线程守护以便能够退出
+    thread = publicThread()
+    thread.daemon = True
+    #设置端口只能输入int类型的数据
+    ui.BrokerPort.setValidator(QtGui.QIntValidator())
+    #设置发送时间只能输入浮点类型的数据
+    ui.SendTimer.setValidator(QtGui.QDoubleValidator())
+    #设置间隔超时时间只能输入浮点类型的数据
+    ui.BeyondTime.setValidator(QtGui.QDoubleValidator())
+    #连接函数注册
+    ui.LinkButton.clicked.connect(linkmqtt)
+    #取消连接注册
+    ui.UnlinkButton.clicked.connect(unlinkmqtt)
+    #发布文件选取按钮注册
+    ui.FileButton.clicked.connect(fileselect)
+    #设置窗口最大容纳字符
+    ui.Dialog.maxLength = 65535
+    ui.ReciveMsg.maxLength = 65535
+    #发布文件选择注册
+    ui.PublicCheck.stateChanged.connect(publiccheck)
+    #定时发送选择注册
+    ui.TimerCheck.stateChanged.connect(timercheck)
+    #发送按钮注册
+    ui.SendButton.clicked.connect(sendmessage)
+    #停止发送按钮注册
+    ui.StopSend.clicked.connect(stopsend)
+    #发送清零注册
+    ui.SendClear.clicked.connect(sendclear)
+    #订阅注册
+    ui.RecButton.clicked.connect(recbutton)
+    #取消订阅注册
+    ui.StopRec.clicked.connect(stoprec)
+    #统计清零注册
+    ui.RecClear.clicked.connect(recclear)
+    #记录文件选择注册
+    ui.FileButton2.clicked.connect(filebutton2)
+    #保存配置文件注册
+    ui.SaveButton.clicked.connect(savebutton) 
+    #订阅内容刷新触发
+    ui.AlreadyReceived.textChanged.connect(refresh)
+    #窗口刷新
+    sys.exit(app.exec_())
+
