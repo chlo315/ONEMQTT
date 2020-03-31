@@ -1,2 +1,2 @@
 # ONEMQTT
-MQTT Testing tool include timeout detection and data filtering
+MQTT testing tool include timeout detection and data filtering
